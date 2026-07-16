@@ -98,6 +98,17 @@ def jobs_list(
     reverse_sort: reverse_sort_flag_opt = False,
     locked: locked_opt = False,
     custom_query: query_opt = None,
+    latest_flow: Annotated[
+        int | None,
+        typer.Option(
+            "--latest-flow",
+            "-lf",
+            help="Only show Jobs belonging to the most recently created Flows (by "
+            "creation date). Provide an integer to set the number of latest Flows to "
+            "consider, e.g. '--latest-flow 3' or '-lf 1' for the single latest Flow. "
+            "Incompatible with --flow-id; applied before all other filters.",
+        ),
+    ] = None,
     error: Annotated[
         bool,
         typer.Option(
@@ -141,6 +152,17 @@ def jobs_list(
     job_ids_indexes = get_job_ids_indexes(job_id)
 
     jc = get_job_controller()
+
+    if latest_flow is not None:
+        if flow_id:
+            raise typer.BadParameter("--latest-flow cannot be combined with --flow-id")
+        if latest_flow < 1:
+            raise typer.BadParameter("--latest-flow must be a positive integer")
+        flows_info = jc.get_flows_info(
+            sort=[("created_on", -1)],
+            limit=latest_flow,
+        )
+        flow_id = [fi.flow_id for fi in flows_info]
 
     start_date = get_start_date(start_date, days, hours)
 
