@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import json
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, tzinfo
+from enum import Enum
 from math import ceil
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from typing import TYPE_CHECKING, Any, cast
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from monty.dev import requires
+
+# ``Request`` is used as a runtime annotation: FastHTML resolves the annotation
+# to inject the request object, so it must stay a real (non-TYPE_CHECKING) import.
+from starlette.requests import Request  # noqa: TCH002
 
 try:
     import fasthtml
@@ -17,6 +24,7 @@ try:
         A,
         Button,
         CheckboxX,
+        Details,
         Dialog,
         Div,
         Favicon,
@@ -29,9 +37,11 @@ try:
         Main,
         Option,
         P,
+        Pre,
         Script,
         Select,
         Span,
+        Summary,
         Table,
         Td,
         Th,
@@ -65,8 +75,30 @@ from jobflow_remote import ConfigManager
 from jobflow_remote.jobs.daemon import DaemonManager, DaemonStatus
 from jobflow_remote.jobs.graph import get_mermaid
 from jobflow_remote.jobs.jobcontroller import JobController
-from jobflow_remote.jobs.report import JobsReport
-from jobflow_remote.jobs.state import JobState
+from jobflow_remote.jobs.report import FlowsReport, JobsReport
+from jobflow_remote.jobs.state import FlowState, JobState
+from jobflow_remote.webgui.palette import (
+    CATEGORY_COLORS,
+    STATE_COLORS,
+    categorize_state_counts,
+    state_color,
+)
+
+if TYPE_CHECKING:
+    from jobflow_remote.jobs.data import FlowInfo
+
+# Bokeh is part of the optional ``gui`` extra. Import the chart helpers and the
+# versioned BokehJS CDN URLs together. Bokeh is a hard requirement to start the
+# gui.
+try:
+    from bokeh.resources import CDN
+
+    from jobflow_remote.webgui import charts
+
+    bokeh_headers = tuple(Script(src=url) for url in CDN.js_files)
+except ImportError:
+    charts = None
+    bokeh_headers = ()
 
 id_curr = "current-info"
 id_list = "info-list"
@@ -76,7 +108,7 @@ PAGE_TITLE = Title("Jobflow remote manager")
 
 mermaid_js = """
 import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
-mermaid.initialize({ startOnLoad: false });
+mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
 window.mermaid = mermaid;
 """
 
@@ -90,7 +122,10 @@ def error_handler(req, exc):
             Button(
                 "Cancel",
                 hx_get="/test/close_dialog",
-                hx_target="#dialog-container",
+                # Remove the dialog itself: it may be injected on a page that has
+                # no #dialog-container, so target the dialog by its own id.
+                hx_target="#my-dialog",
+                hx_swap="outerHTML",
                 style="font-weight: bold",
             ),
             cls="card-dialog",
@@ -106,9 +141,15 @@ exception_handlers = {500: error_handler}
 app, rt = fast_app(
     pico=False,  # Disable Pico CSS to use custom styles
     hdrs=(
-        Link(rel="stylesheet", href="./style.css", type="text/css"),
+        Link(rel="stylesheet", href="/style.css", type="text/css"),
         Script(mermaid_js, type="module"),
-        Favicon("jfr_favicon.ico", "jfr_favicon.ico"),
+        # svg-pan-zoom powers the wheel-zoom / drag-pan on the rendered flow
+        # graph SVG (the same approach used by mermaid.live).
+        Script(
+            src="https://cdn.jsdelivr.net/npm/svg-pan-zoom@3.6.1/dist/svg-pan-zoom.min.js"
+        ),
+        *bokeh_headers,
+        Favicon("/jfr_favicon.ico", "/jfr_favicon.ico"),
     ),  # Add custom CSS as a header
     exception_handlers=exception_handlers,
     static_path=Path(__file__).parent,
@@ -133,11 +174,91 @@ js_set_color = """
   }
 """
 
-start_stop_btn_lbl = {
-    "RUNNING": "Stop",
-    "SHUT_DOWN": "Start",
-    "STOPPED": "Start",
+# Daemon states in which the runner is up (or coming up): the toggle button
+# should offer "Stop". Every other state offers "Start".
+running_daemon_status = {
+    DaemonStatus.RUNNING,
+    DaemonStatus.PARTIALLY_RUNNING,
+    DaemonStatus.STARTING,
 }
+
+
+def start_stop_btn_label(status: DaemonStatus) -> str:
+    """Return the toggle-button label ("Stop"/"Start") for a daemon status.
+
+    Parameters
+    ----------
+    status
+        The current status of the daemon.
+
+    Returns
+    -------
+    str
+        ``"Stop"`` if the runner is running (or starting), ``"Start"`` otherwise.
+
+    Notes
+    -----
+    This is reached only on the steady-state / polling path (``projectbar`` on
+    page load and the ``/runner/{proj_name}/status`` poll). The ``start``/``stop``
+    POST handlers instead render a button-less transitional fragment, so the
+    ``STARTING``/``STOPPING`` branches here act as a fallback when those states
+    are observed directly.
+    """
+    return "Stop" if status in running_daemon_status else "Start"
+
+
+def runner_control_items(proj_name: str, status: str, color: str) -> list:
+    """Build the ``Li`` children for the runner-status control group.
+
+    Renders the status pill and the start/stop button. When the runner is
+    stopped (i.e. the button action is ``"Start"``), a "Single process" toggle
+    is included so the user can opt into a single-process runner; when left
+    unchecked the runner starts as a multiprocess daemon.
+
+    Parameters
+    ----------
+    proj_name
+        Name of the project whose runner is controlled.
+    status
+        Current status of the daemon, as a ``DaemonStatus`` name.
+    color
+        Color used to render the status pill.
+
+    Returns
+    -------
+    list
+        The ``Li`` children for the ``#runner-status`` group.
+    """
+    label = start_stop_btn_label(DaemonStatus(status))
+    items = [
+        Li("Runner:"),
+        Li(status, cls="runner-pill", style=f"color: {color};"),
+    ]
+    if label == "Start":
+        items.append(
+            Li(
+                Label(
+                    Input(
+                        type="checkbox",
+                        name="single",
+                        id="runner-single-toggle",
+                    ),
+                    " Single process",
+                )
+            )
+        )
+    items.append(
+        Li(
+            Button(
+                label,
+                hx_post=f"/runner/{proj_name}/{label.lower()}",
+                hx_include="#runner-single-toggle",
+                hx_target="#runner-status",
+            )
+        )
+    )
+    return items
+
 
 status_colors = {
     DaemonStatus.STOPPED: "red",
@@ -152,49 +273,495 @@ cm = ConfigManager()
 
 list_projects = list(cm.projects.keys())
 
-job_controllers = {}
-daemon_managers = {}
-job_controller = None
-job_controller_actions = None
-daemon_manager = None
+# Per-project caches keyed by project name. Resources are created lazily on
+# first access so that routes work even after a server reload or when a deep
+# URL is hit directly (no implicit "current project" state to initialize).
+job_controllers: dict[str, JobController] = {}
+daemon_managers: dict[str, DaemonManager] = {}
+# Reports are cached per (project name, "jobs"|"flows") and only refreshed
+# explicitly (via the "Update" buttons or a changed trend interval).
+reports: dict[tuple[str, str], JobsReport | FlowsReport] = {}
 
 
-def set_job_controller_deamon(project_name):
-    global job_controller, job_controller_actions, daemon_manager  # # noqa: PLW0603
-
-    if project_name not in job_controllers:
-        job_controllers[project_name] = JobController.from_project_name(
-            project_name=project_name
+def get_job_controller(proj_name: str) -> JobController:
+    """Return the cached ``JobController`` for the project, creating it if needed."""
+    if proj_name not in job_controllers:
+        job_controllers[proj_name] = JobController.from_project_name(
+            project_name=proj_name
         )
-        daemon_managers[project_name] = DaemonManager.from_project(
-            cm.get_project(project_name)
-        )
+    return job_controllers[proj_name]
 
-    daemon_manager = daemon_managers[project_name]
-    job_controller = job_controllers[project_name]
-    job_controller_actions = {
+
+def get_daemon_manager(proj_name: str) -> DaemonManager:
+    """Return the cached ``DaemonManager`` for the project, creating it if needed."""
+    if proj_name not in daemon_managers:
+        daemon_managers[proj_name] = DaemonManager.from_project(
+            cm.get_project(proj_name)
+        )
+    return daemon_managers[proj_name]
+
+
+def get_job_controller_actions(proj_name: str) -> dict:
+    """Return the mapping of action labels to ``JobController`` methods."""
+    jc = get_job_controller(proj_name)
+    return {
         "jobs": {
-            "Resume": job_controller.resume_jobs,
-            "Pause": job_controller.pause_jobs,
-            "Stop": job_controller.stop_jobs,
-            "Retry": job_controller.retry_jobs,
-            "Rerun": job_controller.rerun_jobs,
+            "Resume": jc.resume_jobs,
+            "Pause": jc.pause_jobs,
+            "Stop": jc.stop_jobs,
+            "Retry": jc.retry_jobs,
+            "Rerun": jc.rerun_jobs,
         },
         "flows": {
-            "Delete": job_controller.delete_flows,
+            "Delete": jc.delete_flows,
         },
     }
 
 
-jfreport = None
+def update_report(
+    proj_name: str, what: str = "jobs", interval: str = "days", ni: int = 7
+) -> JobsReport | FlowsReport:
+    """Regenerate and cache the report for the given project and type."""
+    jc = get_job_controller(proj_name)
+    report: JobsReport | FlowsReport
+    if what == "flows":
+        report = FlowsReport.generate_report(jc, interval=interval, num_intervals=ni)
+    else:
+        report = JobsReport.generate_report(jc, interval=interval, num_intervals=ni)
+    reports[(proj_name, what)] = report
+    return report
 
 
-def update_jfreport(interval: str = "days", ni: int = 7):
-    global jfreport  # noqa: PLW0603
+def get_report(proj_name: str, what: str = "jobs") -> JobsReport | FlowsReport | None:
+    """Return the cached report for the project, or ``None`` if not generated yet."""
+    return reports.get((proj_name, what))
 
-    jfreport = JobsReport().generate_report(
-        job_controller, interval=interval, num_intervals=ni
+
+# States that require user attention, shown in the dashboard attention list.
+ATTENTION_STATES = [JobState.FAILED, JobState.REMOTE_ERROR, JobState.PAUSED]
+
+
+def state_badge(state: JobState | FlowState):
+    """
+    Render a job/flow state as a small colored badge.
+
+    The badge color comes from the shared :data:`~jobflow_remote.webgui.palette`
+    map, so tables, the dashboard attention list and the charts all use the same
+    visual language for a given state.
+
+    Parameters
+    ----------
+    state
+        The ``JobState`` or ``FlowState`` to render.
+
+    Returns
+    -------
+    FT
+        A ``Span`` element styled as a state badge.
+    """
+    return Span(
+        state.name, cls="state-badge", style=f"background:{state_color(state.name)};"
     )
+
+
+def flow_progress_bar(flow_info: FlowInfo):
+    """
+    Build a horizontal, segmented bar summarizing a flow's job states.
+
+    The jobs of the flow are grouped into the shared operational categories
+    (see :func:`~jobflow_remote.webgui.palette.categorize_state_counts`), with
+    completed jobs shown as a leading green segment. Each segment's width is
+    proportional to its job count and its color comes from the shared palette,
+    so the bar uses the same visual language as the dashboard charts.
+
+    Parameters
+    ----------
+    flow_info
+        A ``FlowInfo`` with its per-job ``job_states`` populated (i.e. queried
+        ``with_jobs_info=True``).
+
+    Returns
+    -------
+    FT
+        A ``Div`` with one colored segment per non-empty category.
+    """
+    state_counts = Counter(flow_info.job_states)
+    completed, total, categories = categorize_state_counts(dict(state_counts), "jobs")
+    if total == 0:
+        return Div(cls="flow-bar")
+    segments = [("Completed", completed, STATE_COLORS["COMPLETED"])]
+    segments += [
+        (name, count, CATEGORY_COLORS.get(name, "#bdc3c7"))
+        for name, count in categories.items()
+    ]
+    seg_divs = [
+        Div(
+            style=f"width:{count / total * 100:.4f}%;background:{color};",
+            cls="flow-bar-seg",
+            title=f"{label}: {count}",
+        )
+        for label, count, color in segments
+        if count
+    ]
+    return Div(*seg_divs, cls="flow-bar", title=f"{completed}/{total} completed")
+
+
+def flow_board_card(flow_info: FlowInfo, proj_name: str):
+    """
+    Build one collapsible flow card for the flows board.
+
+    The (always visible) header shows the flow name, its job count, a state
+    badge and the :func:`flow_progress_bar`. Expanding the card reveals a
+    scrollable list of the flow's jobs; clicking a job row opens the existing
+    job-detail popup (reusing the ``/{proj}/jobs/dialog/{db_id}`` route).
+
+    Parameters
+    ----------
+    flow_info
+        A ``FlowInfo`` queried ``with_jobs_info=True``.
+    proj_name
+        The project name (used to build the job-dialog links).
+
+    Returns
+    -------
+    FT
+        A ``Details`` accordion element.
+    """
+    rows = [
+        Tr(
+            Td(state_badge(jstate)),
+            Td(Span(db_id, cls="row-id")),
+            Td(jname),
+            Td(worker or "-"),
+            hx_get=f"/{proj_name}/jobs/dialog/{db_id}",
+            hx_target="#dialog-container",
+            hx_swap="innerHTML",
+            cls="job-row",
+        )
+        for db_id, jname, jstate, worker in zip(
+            flow_info.db_ids,
+            flow_info.job_names,
+            flow_info.job_states,
+            flow_info.workers,
+            strict=False,
+        )
+    ]
+    body = (
+        ScrollableArea(Table(*rows), height="260px")
+        if rows
+        else P("No jobs in this flow.", cls="muted")
+    )
+    return Details(
+        Summary(
+            Span(flow_info.name or "(unnamed)", cls="flow-board-name"),
+            Span(f"{len(flow_info.db_ids)} jobs", cls="muted flow-board-count"),
+            state_badge(flow_info.state),
+            flow_progress_bar(flow_info),
+            cls="flow-board-summary",
+        ),
+        body,
+        cls="flow-board-card card",
+    )
+
+
+def state_overview(state_counts: dict, what: str):
+    """
+    Build the "completed" headline metric and the category bar chart.
+
+    Parameters
+    ----------
+    state_counts
+        Mapping of state to count for the jobs/flows.
+    what
+        Either ``"jobs"`` or ``"flows"`` (used only for empty messages).
+
+    Returns
+    -------
+    FT | None
+        A component with the progress headline and the category bar chart, or
+        ``None`` when Bokeh is unavailable.
+    """
+    if charts is None:
+        return None
+    completed, total, categories = categorize_state_counts(dict(state_counts), what)
+    if total == 0:
+        return P(f"No {what} found.")
+    pct = (completed / total * 100) if total else 0.0
+    headline = Div(
+        Span(f"Completed: {completed} / {total} ", cls="progress-num"),
+        Span(f"({pct:.1f}%)", cls="progress-pct"),
+        Div(
+            Div(style=f"width: {pct:.1f}%;", cls="progress-fill"),
+            cls="progress-track",
+        ),
+        cls="progress-headline",
+    )
+    return Div(
+        headline, charts.bokeh_chart(charts.category_bar_figure(categories, what))
+    )
+
+
+def _format_elapsed(now: datetime, start: datetime | None) -> str:
+    """Return a compact ``Hh Mm`` / ``Mm Ss`` string for ``now - start``."""
+    if start is None:
+        return "-"
+    total = max(0, int((now - start.replace(tzinfo=timezone.utc)).total_seconds()))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {seconds}s"
+    return f"{seconds}s"
+
+
+def dashboard_health_strip(proj_name: str, jobs_report: JobsReport):
+    """Build the runner-status + attention-counts strip at the top of the dashboard."""
+    status, color = get_runner_status(proj_name)
+    state_counts = jobs_report.state_counts
+    badge_specs = [
+        ("FAILED", JobState.FAILED, "#e74c3c"),
+        ("REMOTE_ERROR", JobState.REMOTE_ERROR, "#e67e22"),
+        ("PAUSED", JobState.PAUSED, "#9b59b6"),
+    ]
+    badges = [
+        Span(
+            f"{state_counts.get(st, 0)} {label}",
+            cls="health-badge",
+            style=f"background:{c};",
+        )
+        for label, st, c in badge_specs
+        if state_counts.get(st, 0)
+    ]
+    if not badges:
+        badges = [Span("All clear", cls="health-badge", style="background:#2ecc71;")]
+    return Div(
+        Span("Runner:", style="font-weight:bold;"),
+        Span(status, cls="runner-pill", style=f"color:{color};"),
+        Span("Attention:", style="font-weight:bold; margin-left:16px;"),
+        *badges,
+        cls="health-strip",
+    )
+
+
+def dashboard_kpis(jobs_report: JobsReport, flows_report: FlowsReport):
+    """Build the row of headline KPI cards."""
+    flows_total = sum(flows_report.state_counts.values())
+    jobs_total = sum(jobs_report.state_counts.values())
+    failure_rate = (jobs_report.error / jobs_total * 100) if jobs_total else 0.0
+    cards = [
+        ("Flows", str(flows_total)),
+        ("Flows running", str(flows_report.running)),
+        ("Flows completed", str(flows_report.completed)),
+        ("Job failure rate", f"{failure_rate:.1f}%"),
+    ]
+    return Div(
+        *[
+            Div(
+                Div(value, cls="kpi-value"),
+                Div(label, cls="kpi-label"),
+                cls="kpi-card",
+            )
+            for label, value in cards
+        ],
+        cls="kpi-row",
+    )
+
+
+def dashboard_worker_card(jobs_report: JobsReport):
+    """Build the worker-utilization card."""
+    util = jobs_report.worker_utilization
+    if charts is None or not util:
+        return Div(H4("Worker utilization"), P("No data."), cls="card")
+    return Div(
+        H4("Worker utilization"),
+        charts.bokeh_chart(charts.worker_utilization_figure(util)),
+        cls="card",
+    )
+
+
+def dashboard_longest_running(jobs_report: JobsReport, proj_name: str):
+    """Build the longest-running-jobs card."""
+    now = datetime.now(timezone.utc)
+    jobs = jobs_report.longest_running
+    if not jobs:
+        return Div(H4("Longest running jobs"), P("No running jobs."), cls="card")
+    rows = [
+        Tr(
+            Td(
+                A(
+                    job.db_id,
+                    hx_get=f"/{proj_name}/jobs/dialog/{job.db_id}",
+                    hx_target="#dialog-container",
+                    hx_swap="innerHTML",
+                )
+            ),
+            Td(job.name),
+            Td(job.worker),
+            Td(_format_elapsed(now, job.start_time)),
+        )
+        for job in jobs
+    ]
+    return Div(
+        H4("Longest running jobs"),
+        Table(Tr(Th("DB id"), Th("Name"), Th("Worker"), Th("Elapsed")), *rows),
+        cls="card",
+    )
+
+
+def dashboard_attention_list(proj_name: str):
+    """Build the table of jobs that need attention (failed / remote-error / paused)."""
+    job_controller = get_job_controller(proj_name)
+    jobs = job_controller.get_jobs_info(
+        states=ATTENTION_STATES, sort=[("updated_on", -1)], limit=20
+    )
+    if not jobs:
+        return Div(
+            H4("Needs attention"),
+            P("No jobs need attention."),
+            cls="card",
+        )
+    rows = [
+        Tr(
+            Td(
+                A(
+                    job.db_id,
+                    hx_get=f"/{proj_name}/jobs/dialog/{job.db_id}",
+                    hx_target="#dialog-container",
+                    hx_swap="innerHTML",
+                )
+            ),
+            Td(job.name),
+            Td(state_badge(job.state)),
+            Td(job.worker),
+            Td(job.updated_on.replace(tzinfo=timezone.utc).strftime("%Y-%m-%d %H:%M")),
+        )
+        for job in jobs
+    ]
+    return Div(
+        H4("Needs attention (failed / remote-error / paused)"),
+        Table(
+            Tr(Th("DB id"), Th("Name"), Th("State"), Th("Worker"), Th("Updated")),
+            *rows,
+        ),
+        cls="card",
+    )
+
+
+def dashboard_trends_chart(jobs_report: JobsReport):
+    """Build the jobs throughput chart, titled to make clear it refers to jobs."""
+    if charts is None:
+        return None
+    return charts.bokeh_chart(
+        charts.trends_figure(jobs_report.trends, title="Throughput over time (jobs)")
+    )
+
+
+def dashboard_trends_card(proj_name: str, jobs_report: JobsReport):
+    """
+    Build the throughput card with an interval selector.
+
+    The selector lets the user change the time range of the jobs throughput
+    chart (as the standalone trends view did), refreshing only the chart.
+    """
+    interval = jobs_report.trends.interval
+    ni = jobs_report.trends.num_intervals
+    return Div(
+        H4("Throughput over time (jobs)"),
+        Form(
+            Label("Last"),
+            Input(type="number", value=ni, name="ni", style="width: 70px;"),
+            Select(
+                *[
+                    Option(i, selected=i == interval)
+                    for i in ("days", "hours", "months", "years")
+                ],
+                name="interval",
+            ),
+            Button(
+                "Update",
+                hx_post=f"/{proj_name}/dashboard/trends",
+                hx_include="[name='interval'],[name='ni']",
+                hx_target="#dashboard-trends-chart",
+                hx_swap="innerHTML",
+            ),
+            cls="group",
+        ),
+        Div(dashboard_trends_chart(jobs_report), id="dashboard-trends-chart"),
+        cls="card",
+    )
+
+
+@rt("/{proj_name}/dashboard/trends", methods=["POST"])
+def get_dashboard_trends(proj_name: str, interval: str = "days", ni: int = 7):
+    """Regenerate the jobs report if needed and return the updated throughput chart."""
+    report = get_report(proj_name, "jobs")
+    if (
+        not report
+        or report.trends.interval != interval
+        or report.trends.num_intervals != ni
+    ):
+        report = update_report(proj_name, "jobs", interval, ni)
+    return dashboard_trends_chart(cast("JobsReport", report))
+
+
+def build_dashboard(proj_name: str):
+    """
+    Assemble the full project dashboard.
+
+    Reports are taken from the cache when available and generated on demand
+    otherwise, so the dashboard is cheap to re-render but refreshes its data only
+    when explicitly asked to (the "Refresh" button regenerates the reports).
+    """
+    jobs_report = cast(
+        "JobsReport", get_report(proj_name, "jobs") or update_report(proj_name, "jobs")
+    )
+    flows_report = cast(
+        "FlowsReport",
+        get_report(proj_name, "flows") or update_report(proj_name, "flows"),
+    )
+
+    return Div(
+        Div(
+            H3(f"Dashboard: {proj_name}"),
+            Button(
+                "Refresh",
+                hx_get=f"/{proj_name}/dashboard",
+                hx_target="#dashboard",
+                hx_swap="outerHTML",
+            ),
+            cls="dashboard-header",
+        ),
+        dashboard_health_strip(proj_name, jobs_report),
+        dashboard_kpis(jobs_report, flows_report),
+        Div(
+            Div(
+                H4("Flows"),
+                state_overview(flows_report.state_counts, "flows"),
+                cls="card",
+            ),
+            Div(
+                H4("Jobs"), state_overview(jobs_report.state_counts, "jobs"), cls="card"
+            ),
+            cls="dashboard-two-col",
+        ),
+        dashboard_trends_card(proj_name, jobs_report),
+        Div(
+            dashboard_worker_card(jobs_report),
+            dashboard_longest_running(jobs_report, proj_name),
+            cls="dashboard-two-col",
+        ),
+        dashboard_attention_list(proj_name),
+        id="dashboard",
+    )
+
+
+@rt("/{proj_name}/dashboard")
+def get_dashboard(proj_name: str):
+    """Regenerate the reports and return the refreshed dashboard fragment."""
+    update_report(proj_name, "jobs")
+    update_report(proj_name, "flows")
+    return build_dashboard(proj_name)
 
 
 # Navigation bar component
@@ -204,7 +771,7 @@ def projectbar(proj_name: str = "", what: str = ""):
     return Div(
         Script(js_set_color),
         Ul(
-            A(Img(src="./logo_jfr.png", height=50), href="/"),
+            A(Img(src="/logo_jfr.png", height=50), href="/"),
             Li("Projects:"),
             Li(
                 Select(
@@ -222,7 +789,7 @@ def projectbar(proj_name: str = "", what: str = ""):
             (
                 Li(
                     A(
-                        "Report",
+                        "Dashboard",
                         hx_get=f"/projects?proj_name={proj_name}",
                         hx_push_url="true",
                         hx_target="body",
@@ -256,23 +823,22 @@ def projectbar(proj_name: str = "", what: str = ""):
                                 cls="navbar-link",
                             )
                         ),
+                        Li(
+                            A(
+                                "Flows board",
+                                hx_get=f"/{proj_name}/flows/board",
+                                hx_target="#prj-container",
+                                hx_push_url="true",
+                                onclick="setActiveLink(this)",
+                                cls="navbar-link",
+                            )
+                        ),
                     ),
                     cls="group",
                 ),
                 Group(
                     Ul(
-                        Li("Runner:"),
-                        Li(
-                            f"{status}",
-                            style=f"color: {color}; background-color: black; padding: 3px 5px; border-radius: 4px;",
-                        ),
-                        Li(
-                            Button(
-                                f"{start_stop_btn_lbl[status]}",
-                                hx_post=f"/runner/{proj_name}/{start_stop_btn_lbl[status].lower()}",
-                                hx_target="#runner-status",
-                            )
-                        ),
+                        *runner_control_items(proj_name, status, color),
                     ),
                     hx_get=f"/runner/{proj_name}/status",
                     hx_trigger="every 30s",
@@ -288,22 +854,41 @@ def projectbar(proj_name: str = "", what: str = ""):
     )
 
 
-def ScrollableArea(*content, height="300px"):
-    return Div(
-        *content,
-        style=f"height: {height}; overflow-y: auto; border: 1px solid #ccc; padding: 10px;",
-    )
+def ScrollableArea(*content, height: str = "300px"):
+    """Wrap content in a fixed-height, vertically scrollable box."""
+    return Div(*content, cls="scrollable-area", style=f"height: {height};")
 
 
 @rt("/")
 def get_home():
+    projects = cm.projects
+    if projects:
+        projects_view = Div(
+            P("Select a project to view its dashboard and query its jobs and flows."),
+            Table(
+                Tr(Th("Project"), Th("Workers")),
+                *[
+                    Tr(
+                        Td(Span(name, cls="row-id")),
+                        Td(str(len(project.workers))),
+                        hx_get=f"/projects?proj_name={name}",
+                        hx_target="body",
+                        hx_push_url="true",
+                        cls="job-row",
+                    )
+                    for name, project in projects.items()
+                ],
+                cls="card",
+            ),
+        )
+    else:
+        projects_view = P("No projects are currently configured.", cls="muted")
+
     return PAGE_TITLE, Main(
         projectbar(),
         Div(
-            H4(
-                "Select project from the navigation bar above to view and query Jobs and Flows."
-            ),
-            P("Add here some general information, e.g. the list of available projects"),
+            H3("Jobflow Remote manager"),
+            projects_view,
             cls="container",
             id="prj-container",
         ),
@@ -311,8 +896,8 @@ def get_home():
     )
 
 
-@rt("/actions/{action}/{what}/open_dialog", methods=["POST"])
-def open_dialog(action: str, what: str, kwargs: dict):
+@rt("/actions/{proj_name}/{action}/{what}/open_dialog", methods=["POST"])
+def open_dialog(proj_name: str, action: str, what: str, kwargs: dict):
     selected = [f"{v}" for k, v in kwargs.items()]
 
     # Add checkboxes for delete_flow options
@@ -348,7 +933,7 @@ def open_dialog(action: str, what: str, kwargs: dict):
             ),
             Button(
                 "Confirm",
-                hx_post=f"/actions/{action}/{what}/run",
+                hx_post=f"/actions/{proj_name}/{action}/{what}/run",
                 hx_include="[name='ckbx_action'],[name='delete_options']",
                 hx_target="#dialog-container",
                 hx_swap="innerHTML",
@@ -364,29 +949,35 @@ def open_dialog(action: str, what: str, kwargs: dict):
     )
 
 
-@rt("/actions/{action}/{what}/run", methods=["POST"])
-def run_action(action: str, what: str, kwargs: dict):
+@rt("/actions/{proj_name}/{action}/{what}/run", methods=["POST"])
+def run_action(proj_name: str, action: str, what: str, kwargs: dict):
     selected = [v for k, v in kwargs.items() if k != "delete_options"]
     delete_options = kwargs.get("delete_options", [])
 
+    actions = get_job_controller_actions(proj_name)
     if action == "Delete" and what == "flows":
         delete_output = "delete_output" in delete_options
         delete_files = "delete_files" in delete_options
-        response = job_controller_actions[what][action](
+        response = actions[what][action](
             selected, delete_output=delete_output, delete_files=delete_files
         )
     else:
-        response = job_controller_actions[what][action](db_ids=selected)
+        response = actions[what][action](db_ids=selected)
 
+    # A single "Close" button both dismisses the dialog and refreshes the list:
+    # re-posting the query rebuilds ``#query-results`` (which contains the
+    # dialog), so the updated states show up and the dialog disappears in one
+    # step. The current filters are taken from the still-present search form.
     return Dialog(
         Div(
-            H3(f"Action Selected: {action}"),
-            P(f"Applied on {response} {what}"),
-            P(f"{delete_options}"),
+            H3(f"{action} applied"),
+            P(f"Applied {action} to {response} {what}."),
             Button(
-                "Cancel",
-                hx_get="/test/close_dialog",
-                hx_target="#dialog-container",
+                "Close",
+                hx_post=f"/{proj_name}/{what}/query",
+                hx_include="#search-form",
+                hx_target="#query-results",
+                hx_swap="innerHTML",
                 style="font-weight: bold",
             ),
             cls="card-dialog",
@@ -404,18 +995,15 @@ def close_dialog():
 
 # handle starting and stopping the runner
 @rt("/runner/{proj_name}/start", methods=["POST"])
-def start_runner_route(proj_name: str):
-    dm = daemon_managers[proj_name]
-    dm.start()
+def start_runner_route(proj_name: str, single: bool = False):
+    dm = get_daemon_manager(proj_name)
+    dm.start(single=single)
     status = "STARTING"
     color = status_colors[DaemonStatus(status)]
     return Group(
         Ul(
             Li("Runner:"),
-            Li(
-                status,
-                style=f"color: {color}; background-color: black; padding-right: 10px; border-radius: 4px;",
-            ),
+            Li(status, cls="runner-pill", style=f"color: {color};"),
         ),
         id="runner-status",
         hx_get=f"/runner/{proj_name}/status",
@@ -427,17 +1015,14 @@ def start_runner_route(proj_name: str):
 
 @rt("/runner/{proj_name}/stop", methods=["POST"])
 def stop_runner_route(proj_name: str):
-    dm = daemon_managers[proj_name]
+    dm = get_daemon_manager(proj_name)
     dm.shut_down()
     status = "STOPPING"
     color = status_colors[DaemonStatus(status)]
     return Group(
         Ul(
             Li("Runner:"),
-            Li(
-                status,
-                style=f"color: {color}; background-color: black; padding-right: 10px; border-radius: 4px;",
-            ),
+            Li(status, cls="runner-pill", style=f"color: {color};"),
         ),
         id="runner-status",
         hx_get=f"/runner/{proj_name}/status",
@@ -452,18 +1037,7 @@ def get_runner_status_update(proj_name: str):
     status, color = get_runner_status(proj_name)
     return Group(
         Ul(
-            Li("Runner:"),
-            Li(
-                f"{status}",
-                style=f"color: {color}; background-color: black; padding-right: 10px; border-radius: 4px;",
-            ),
-            Li(
-                Button(
-                    f"{start_stop_btn_lbl[status]}",
-                    hx_post=f"/runner/{proj_name}/{start_stop_btn_lbl[status].lower()}",
-                    hx_target="#runner-status",
-                )
-            ),
+            *runner_control_items(proj_name, status, color),
         ),
         hx_get=f"/runner/{proj_name}/status",
         hx_trigger="every 30s",
@@ -474,7 +1048,7 @@ def get_runner_status_update(proj_name: str):
 
 
 def get_runner_status(proj_name: str):
-    dm = daemon_managers[proj_name]
+    dm = get_daemon_manager(proj_name)
     current_status = dm.check_status()
     color = status_colors[current_status]
 
@@ -493,11 +1067,10 @@ def get_proj_home(proj_name: str = ""):
             ),
         )
 
-    set_job_controller_deamon(proj_name)
-
-    if jfreport:
-        interval = jfreport.trends.interval
-        ni = jfreport.trends.num_intervals
+    jobs_report = get_report(proj_name, "jobs")
+    if jobs_report:
+        interval = jobs_report.trends.interval
+        ni = jobs_report.trends.num_intervals
     else:
         interval = "days"
         ni = 7
@@ -506,88 +1079,91 @@ def get_proj_home(proj_name: str = ""):
         Script(mermaid_js, type="module"),
         projectbar(proj_name),
         Div(
-            H3(f"Report for the Project: {proj_name}"),
-            P("Description of the project"),
-            Div(
-                H3("Jobs Report"),
-                Ul(
-                    Li(
-                        Button(
-                            "Summary Jobs Report",
-                            hx_get=f"/{proj_name}/jobs/sum_report",
-                            hx_target="#jobs-report",
-                        )
-                    ),
-                    Li(
-                        Button(
-                            "Jobs State Distribution",
-                            hx_get=f"/{proj_name}/jobs/state_distro",
-                            hx_target="#jobs-report",
-                        )
-                    ),
-                    Li(
-                        Form(
+            build_dashboard(proj_name),
+            Details(
+                Summary("Detailed reports"),
+                Div(
+                    H3("Jobs Report"),
+                    Ul(
+                        Li(
                             Button(
-                                "Jobs Trend for the last",
-                                hx_post=f"/{proj_name}/jobs/trends/",
-                                hx_include="[name='interval'],[name='ni']",
+                                "Summary Jobs Report",
+                                hx_get=f"/{proj_name}/jobs/sum_report",
                                 hx_target="#jobs-report",
-                            ),
-                            Select(
-                                *[
-                                    Option(i, selected=i == interval)
-                                    for i in ("days", "hours", "months", "years")
-                                ],
-                                name="interval",
-                            ),
-                            Input(type="number", value=ni, name="ni"),
-                        )
-                    ),
-                ),
-                Div(id="jobs-report"),
-                id="buttons-jobs-report",
-                cls="card",
-            ),
-            Div(
-                H3("Flows Report"),
-                Ul(
-                    Li(
-                        Button(
-                            "Summary Flows Report",
-                            hx_get=f"/{proj_name}/flows/sum_report",
-                            hx_target="#flows-report",
-                        )
-                    ),
-                    Li(
-                        Button(
-                            "Flows State Distribution",
-                            hx_get=f"/{proj_name}/flows/state_distro",
-                            hx_target="#flows-report",
-                        )
-                    ),
-                    Li(
-                        Form(
+                            )
+                        ),
+                        Li(
                             Button(
-                                "Flows Trend for the last",
-                                hx_post=f"/{proj_name}/flows/trends/",
-                                hx_include="[name='interval'],[name='ni']",
-                                hx_target="#flows-report",
-                            ),
-                            Select(
-                                *[
-                                    Option(i, selected=i == interval)
-                                    for i in ("days", "hours", "months", "years")
-                                ],
-                                name="interval",
-                            ),
-                            Input(type="number", value=ni, name="ni"),
-                        )
+                                "Jobs State Distribution",
+                                hx_get=f"/{proj_name}/jobs/state_distro",
+                                hx_target="#jobs-report",
+                            )
+                        ),
+                        Li(
+                            Form(
+                                Button(
+                                    "Jobs Trend for the last",
+                                    hx_post=f"/{proj_name}/jobs/trends/",
+                                    hx_include="[name='interval'],[name='ni']",
+                                    hx_target="#jobs-report",
+                                ),
+                                Select(
+                                    *[
+                                        Option(i, selected=i == interval)
+                                        for i in ("days", "hours", "months", "years")
+                                    ],
+                                    name="interval",
+                                ),
+                                Input(type="number", value=ni, name="ni"),
+                            )
+                        ),
                     ),
+                    Div(id="jobs-report"),
+                    id="buttons-jobs-report",
+                    cls="card",
                 ),
-                Div(id="flows-report"),
-                id="buttons-flows-report",
-                cls="card",
+                Div(
+                    H3("Flows Report"),
+                    Ul(
+                        Li(
+                            Button(
+                                "Summary Flows Report",
+                                hx_get=f"/{proj_name}/flows/sum_report",
+                                hx_target="#flows-report",
+                            )
+                        ),
+                        Li(
+                            Button(
+                                "Flows State Distribution",
+                                hx_get=f"/{proj_name}/flows/state_distro",
+                                hx_target="#flows-report",
+                            )
+                        ),
+                        Li(
+                            Form(
+                                Button(
+                                    "Flows Trend for the last",
+                                    hx_post=f"/{proj_name}/flows/trends/",
+                                    hx_include="[name='interval'],[name='ni']",
+                                    hx_target="#flows-report",
+                                ),
+                                Select(
+                                    *[
+                                        Option(i, selected=i == interval)
+                                        for i in ("days", "hours", "months", "years")
+                                    ],
+                                    name="interval",
+                                ),
+                                Input(type="number", value=ni, name="ni"),
+                            )
+                        ),
+                    ),
+                    Div(id="flows-report"),
+                    id="buttons-flows-report",
+                    cls="card",
+                ),
             ),
+            Div(Script(mermaid_js, type="module"), id="dialog-container"),
             id="prj-container",
         ),
     )
@@ -595,50 +1171,67 @@ def get_proj_home(proj_name: str = ""):
 
 @rt("/{proj_name}/{what}/sum_report")
 def sum_report(proj_name: str, what: str):
-    if not jfreport:
-        update_jfreport()
+    report_data = get_report(proj_name, what)
+    if not report_data:
+        report_data = update_report(proj_name, what)
 
-    state_counts = Counter(jfreport.state_counts)
+    state_counts = Counter(report_data.state_counts)
+    total_jobs = state_counts.total()
+
+    update_btn = Button(
+        "Update",
+        hx_get=f"/{proj_name}/{what}/sum_report",
+        hx_target=f"#{what}-report",
+    )
+
+    if total_jobs == 0:
+        return Div(
+            Div(update_btn, P(f"No {what} found."), cls="job-state-report"),
+            cls="container",
+        )
 
     # Find the most common state
     most_common_state, most_common_count = state_counts.most_common(1)[0]
 
-    running_count = jfreport.running
-    completed_count = jfreport.completed
-    error_count = jfreport.error
-    active_count = jfreport.active
+    running_count = report_data.running
+    completed_count = report_data.completed
+    error_count = report_data.error
 
     # Calculate percentages
-    total_jobs = state_counts.total()
     state_percentages = {
         state: (count / total_jobs) * 100 for state, count in state_counts.items()
     }
 
+    rows = [
+        Tr(Td(f"Total number of {what}:"), Td(f"{total_jobs}")),
+        Tr(
+            Td("Most common state:"),
+            Td(
+                f"{most_common_state.name} ({most_common_count} {what}, {state_percentages[most_common_state]:.2f}%)"
+            ),
+        ),
+        Tr(Td(f"Running {what}:"), Td(f"{running_count}")),
+        Tr(Td(f"Completed {what}:"), Td(f"{completed_count}")),
+        Tr(
+            Td(f"Sum of failed and remote error {what}:"),
+            Td(f"{error_count}"),
+        ),
+    ]
+    # The following metrics are only available in the jobs report.
+    if what == "jobs":
+        jobs_data = cast("JobsReport", report_data)
+        rows.extend(
+            [
+                Tr(Td(f"Sum of all active {what}:"), Td(f"{jobs_data.active}")),
+                Tr(Td("Longest running:"), Td(f"{jobs_data.longest_running}")),
+                Tr(Td("Worker utilization:"), Td(f"{jobs_data.worker_utilization}")),
+            ]
+        )
+
     # Create the report
     report = Div(
-        Button(
-            "Update",
-            hx_get=f"/{proj_name}/{what}/sum_report",
-            hx_target=f"#{what}-report",
-        ),
-        Table(
-            Tr(Td(f"Total number of {what}:"), Td(f"{total_jobs}")),
-            Tr(
-                Td("Most common state:"),
-                Td(
-                    f"{most_common_state.name} ({most_common_count} {what}, {state_percentages[most_common_state]:.2f}%)"
-                ),
-            ),
-            Tr(Td(f"Running {what}:"), Td(f"{running_count}")),
-            Tr(Td(f"Completed {what}:"), Td(f"{completed_count}")),
-            Tr(
-                Td(f"Sum of failed, remote error, and paused {what}:"),
-                Td(f"{error_count}"),
-            ),
-            Tr(Td(f"Sum of all active {what}:"), Td(f"{active_count}")),
-            Tr(Td("Longest running:"), Td(f"{jfreport.longest_running}")),
-            Tr(Td("Worker utilization:"), Td(f"{jfreport.worker_utilization}")),
-        ),
+        update_btn,
+        Table(*rows),
         cls="job-state-report",
     )
 
@@ -647,30 +1240,61 @@ def sum_report(proj_name: str, what: str):
 
 @rt("/{proj_name}/{what}/trends/", methods=["POST"])
 def trends(proj_name: str, what: str, interval: str = "days", ni: int = 7):
-    if not jfreport:
-        update_jfreport()
+    report_data = get_report(proj_name, what)
+    if (
+        not report_data
+        or report_data.trends.interval != interval
+        or report_data.trends.num_intervals != ni
+    ):
+        report_data = update_report(proj_name, what, interval, ni)
 
-    if jfreport.trends.interval != interval or jfreport.trends.num_intervals != ni:
-        update_jfreport(interval, ni)
+    # trends table. Only the jobs report tracks the remote error trend.
+    if what == "flows":
+        trend_table = Table(
+            Tr(Th("Dates"), Th("Completed"), Th("Failed")),
+            *[
+                Tr(Td(d), Td(c), Td(f))
+                for d, c, f in zip(
+                    report_data.trends.dates,
+                    report_data.trends.completed,
+                    report_data.trends.failed,
+                    strict=True,
+                )
+            ],
+            cls="trend-table",
+        )
+    else:
+        trend_table = Table(
+            Tr(Th("Dates"), Th("Completed"), Th("Failed"), Th("Remote error")),
+            *[
+                Tr(Td(d), Td(c), Td(f), Td(r))
+                for d, c, f, r in zip(
+                    report_data.trends.dates,
+                    report_data.trends.completed,
+                    report_data.trends.failed,
+                    cast("JobsReport", report_data).trends.remote_error,
+                    strict=True,
+                )
+            ],
+            cls="trend-table",
+        )
 
-    # trends table
-    trend_table = Table(
-        Tr(Th("Dates"), Th("Completed"), Th("Failed"), Th("Remote error")),
-        *[
-            Tr(Td(d), Td(c), Td(f), Td(r))
-            for d, c, f, r in zip(
-                jfreport.trends.dates,
-                jfreport.trends.completed,
-                jfreport.trends.failed,
-                jfreport.trends.remote_error,
-                strict=True,
+    # Stacked bar chart of the trends (skipped if Bokeh is unavailable).
+    chart = (
+        charts.bokeh_chart(
+            charts.trends_figure(
+                report_data.trends, title=f"Throughput over time ({what})"
             )
-        ],
-        cls="trend-table",
+        )
+        if charts is not None
+        else None
     )
 
     report = Div(
-        H3(f"{what.capitalize()} Trend Table:"), trend_table, cls="job-state-report"
+        chart,
+        H3(f"{what.capitalize()} Trend Table:"),
+        trend_table,
+        cls="job-state-report",
     )
 
     return Div(report, cls="container")
@@ -678,19 +1302,39 @@ def trends(proj_name: str, what: str, interval: str = "days", ni: int = 7):
 
 @rt("/{proj_name}/{what}/state_distro")
 def state_distro(proj_name: str, what: str):
-    if not jfreport:
-        update_jfreport()
+    report_data = get_report(proj_name, what)
+    if not report_data:
+        report_data = update_report(proj_name, what)
 
-    state_counts = Counter(jfreport.state_counts)
+    state_counts = Counter(report_data.state_counts)
 
     # Calculate percentages
     total_jobs = state_counts.total()
+    update_btn = Button(
+        "Update",
+        hx_get=f"/{proj_name}/{what}/state_distro",
+        hx_target=f"#{what}-report",
+    )
+
+    if total_jobs == 0:
+        return Div(
+            update_btn,
+            Div(P(f"No {what} found."), cls="job-state-report"),
+            cls="container",
+        )
+
     state_percentages = {
         state: (count / total_jobs) * 100 for state, count in state_counts.items()
     }
 
+    # Completed shown as a headline progress metric, with the remaining
+    # operational categories as a bar chart (skipped if Bokeh is unavailable).
+    # Completed is deliberately kept out of the chart so it does not dominate.
+    chart = state_overview(dict(state_counts), what)
+
     # Create the report
     report = Div(
+        chart,
         Table(
             Tr(Th("State"), Th("Count"), Th("Percentage")),
             *[
@@ -706,11 +1350,7 @@ def state_distro(proj_name: str, what: str):
         cls="job-state-report",
     )
     return Div(
-        Button(
-            "Update",
-            hx_get=f"/{proj_name}/{what}/state_distro",
-            hx_target=f"#{what}-report",
-        ),
+        update_btn,
         report,
         cls="container",
     )
@@ -719,91 +1359,306 @@ def state_distro(proj_name: str, what: str):
 @rt("/{proj_name}/{what}/info/{jf_id}")
 def get_info_job_flow(jf_id: str, what: str, proj_name: str):
     info = None
+    flow_obj = None
+    job_controller = get_job_controller(proj_name)
 
     if what == "jobs":
-        info = job_controller.get_job_info(db_id=jf_id).dict()
+        job_info = job_controller.get_job_info(db_id=jf_id)
+        info = job_info.model_dump() if job_info else None
     elif what == "flows":
-        info = job_controller.get_flow_info_by_flow_uuid(jf_id)
+        # ``with_jobs_info`` runs a per-flow aggregation joining the flow with
+        # its jobs so the per-job fields (states/names/workers) are populated.
+        # This is a single-flow lookup (the same one the graph tab already
+        # does), so it is cheap; it is deliberately *not* used in the flows
+        # list, where it would join every flow's jobs.
+        flow_info = job_controller.get_flows_info(
+            flow_ids=[jf_id], limit=1, with_jobs_info=True
+        )
+        flow_obj = flow_info[0] if flow_info else None
+        info = flow_obj.model_dump() if flow_obj else None
 
+    label = "Flow" if what == "flows" else "Job"
     if info:
-        return Div(
-            H3(f"Job {jf_id} details"),
-            H3(f"Job name: {info.pop('name')}"),
-            ScrollableArea(
-                *[
-                    Ul(
-                        Li(f"{k}:", style="font-weight: bold"),
-                        Li(f"{v}", style="margin-left: 10px; al"),
+        name = info.pop("name", "")
+        state_val = info.pop("state", None)
+
+        # Surface a remote error (the reason a job is in REMOTE_ERROR) as a
+        # prominent callout at the top. Jobs-only: flows carry no ``remote``.
+        callout_blocks = []
+        remote = info.get("remote")
+        if isinstance(remote, dict) and remote.get("error"):
+            callout_blocks.append(
+                Div(
+                    H4("Remote error"),
+                    Pre(str(remote["error"]), cls="detail-json"),
+                    cls="error-callout",
+                )
+            )
+
+        # For flows, render the per-job data as a dedicated table and drop the
+        # redundant parallel lists / nested jobs dump from the field rendering.
+        extra_blocks = []
+        if what == "flows" and flow_obj is not None:
+            for redundant in (
+                "db_ids",
+                "job_ids",
+                "job_indexes",
+                "workers",
+                "job_states",
+                "job_names",
+                "parents",
+                "hosts",
+                "jobs_info",
+            ):
+                info.pop(redundant, None)
+            job_rows = [
+                Tr(
+                    Td(
+                        A(
+                            db_id,
+                            hx_get=f"/{proj_name}/jobs/dialog/{db_id}",
+                            hx_target="#dialog-container",
+                            hx_swap="innerHTML",
+                        )
+                    ),
+                    Td(jname),
+                    Td(state_badge(jstate)),
+                    Td(worker or "-"),
+                )
+                for db_id, jname, jstate, worker in zip(
+                    flow_obj.db_ids,
+                    flow_obj.job_names,
+                    flow_obj.job_states,
+                    flow_obj.workers,
+                    strict=False,
+                )
+            ]
+            extra_blocks.append(
+                Div(
+                    H4(f"Jobs ({len(flow_obj.db_ids)})"),
+                    Table(
+                        Tr(Th("DB id"), Th("Name"), Th("State"), Th("Worker")),
+                        *job_rows,
+                    ),
+                )
+            )
+
+        # Split fields into simple scalars (shown as a compact two-column table)
+        # and nested structures (shown as collapsible, pretty-printed JSON).
+        simple_rows = []
+        complex_blocks = []
+        open_by_default = {"metadata", "flow_metadata"}
+        for k, v in info.items():
+            if isinstance(v, dict | list) and v:
+                json_text = json.dumps(v, indent=2, default=str)
+                complex_blocks.append(
+                    Details(
+                        Summary(k, cls="detail-key"),
+                        Pre(json_text, cls="detail-json"),
+                        open=k in open_by_default,
                     )
-                    for k, v in info.items()
-                ]
+                )
+                continue
+            if isinstance(v, datetime):
+                cell = v.strftime("%Y-%m-%d %H:%M:%S")
+            elif isinstance(v, Enum):
+                cell = v.name
+            elif v is None or v == [] or v == {}:
+                cell = "-"
+            else:
+                cell = str(v)
+            simple_rows.append(Tr(Td(f"{k}", cls="detail-key"), Td(cell)))
+
+        return Div(
+            Div(
+                H3(name or "(unnamed)", cls="detail-title"),
+                Div(
+                    Span(label, cls="detail-type"),
+                    Span(jf_id, cls="detail-id"),
+                    state_badge(state_val)
+                    if isinstance(state_val, JobState | FlowState)
+                    else None,
+                    cls="detail-subtitle",
+                ),
+                cls="detail-header",
+            ),
+            Div(
+                *callout_blocks,
+                Table(*simple_rows, cls="detail-table"),
+                *extra_blocks,
+                *complex_blocks,
+                cls="detail-body",
             ),
             cls="card-dialog active",
         )
 
-    return P("Job not found")
+    return P(f"{label} not found")
 
 
 @rt("/{proj_name}/flows/graph/{jf_id}")
 def get_graph_job_flow(jf_id: str, proj_name: str):
+    job_controller = get_job_controller(proj_name)
     flowinfo = job_controller.get_flows_info(
         flow_ids=[jf_id], limit=1, with_jobs_info=True
     )[0]
     graph = get_mermaid(flowinfo)
+    # Make each job box link to its standalone detail page. Mermaid node IDs are
+    # the job db_ids, which flowinfo.db_ids enumerates directly.
+    click_lines = "\n".join(
+        f'    click {db_id} "/{proj_name}/jobs/detail/{db_id}"'
+        for db_id in flowinfo.db_ids
+    )
+    graph = f"{graph}\n{click_lines}"
+    # Render the mermaid SVG into a large viewport, then attach svg-pan-zoom so
+    # the graph can be zoomed (wheel) and panned (drag) like on mermaid.live.
+    # The render call retries until both mermaid and svg-pan-zoom are loaded
+    # from their CDNs (they may not be ready when this fragment is swapped in).
     m_script = f"""
-(async function() {{
-    const container = document.getElementById('flow-graph');
-    const {{ svg }} = await window.mermaid.render('graphDiv', `{graph}`);
-    container.innerHTML = svg;
+(function() {{
+    async function render() {{
+        if (!window.mermaid || !window.svgPanZoom) {{
+            setTimeout(render, 50);
+            return;
+        }}
+        const container = document.getElementById('flow-graph');
+        const {{ svg }} = await window.mermaid.render('graphDiv', `{graph}`);
+        container.innerHTML = svg;
+        const svgEl = container.querySelector('svg');
+        svgEl.style.maxWidth = 'none';
+        svgEl.style.width = '100%';
+        svgEl.style.height = '100%';
+        window.svgPanZoom(svgEl, {{
+            zoomEnabled: true,
+            controlIcons: true,
+            fit: true,
+            center: true,
+            minZoom: 0.1,
+            maxZoom: 20,
+            // Bigger step per wheel tick: the default (0.2) makes wheel
+            // zooming feel sluggish on large graphs.
+            zoomScaleSensitivity: 0.5,
+        }});
+    }}
+    render();
 }})();
 """
     return Div(
-        ScrollableArea(Div(id="flow-graph"), Script(m_script)), cls="card-dialog"
+        Div(id="flow-graph", cls="graph-viewport"),
+        Script(m_script),
+        cls="card-dialog graph-card",
+    )
+
+
+def detail_card(jf_id: str, what: str, proj_name: str, *, as_page: bool = False):
+    """
+    Build the tabbed details/graph card for a job or flow.
+
+    The same card is used both inside the modal popup (``as_page=False``) and on
+    the standalone, URL-addressable detail page (``as_page=True``); only the
+    header navigation control differs.
+
+    Parameters
+    ----------
+    jf_id
+        The job ``db_id`` or flow ``flow_id``.
+    what
+        Either ``"jobs"`` or ``"flows"``.
+    proj_name
+        The project name.
+    as_page
+        When ``True`` render a "Back to list" link (page mode); when ``False``
+        render the popup "Close" button plus an "Open full page" link.
+
+    Returns
+    -------
+    FT
+        A ``Card`` element with the tab buttons and tab content.
+    """
+    if as_page:
+        nav = A(
+            "← Back to list",
+            hx_get=f"/{proj_name}/{what}/query",
+            hx_target="#prj-container",
+            hx_push_url="true",
+            cls="btn toolbar-right",
+        )
+    else:
+        # Navigating #prj-container replaces the whole project container (which
+        # holds the popup), so "Open full page" also dismisses the popup.
+        nav = Div(
+            A(
+                "Open full page",
+                hx_get=f"/{proj_name}/{what}/detail/{jf_id}",
+                hx_target="#prj-container",
+                hx_push_url="true",
+                cls="btn",
+            ),
+            Button(
+                "Close",
+                hx_get="/test/close_dialog",
+                hx_target="#dialog-container",
+                style="font-weight: bold",
+                cls="btn toolbar-right",
+            ),
+        )
+    return Card(
+        nav,
+        Div(
+            Button(
+                f"Details {what}",
+                cls="tab active",
+                hx_get=f"/{proj_name}/{what}/info/{jf_id}",
+                hx_target="#tab-content",
+                hx_swap="innerHTML",
+                _="on click remove .active from .tab then add .active to me",
+            ),
+            Button(
+                "Graph Flow",
+                cls="tab",
+                hx_get=f"/{proj_name}/flows/graph/{jf_id}",
+                hx_target="#tab-content",
+                hx_swap="innerHTML",
+                _="on click remove .active from .tab then add .active to me",
+            ),
+            cls="tab-buttons btn",
+        )
+        if what == "flows"
+        else None,
+        Div(
+            get_info_job_flow(jf_id, what, proj_name),
+            id="tab-content",
+            cls="tab-content",
+        ),
+        cls="tabbed-card",
     )
 
 
 @rt("/{proj_name}/{what}/dialog/{jf_id}")
 def get_info_graph_dialog(jf_id: str, what: str, proj_name: str):
     return Dialog(
-        Card(
-            Button(
-                "Close",
-                hx_get="/test/close_dialog",
-                hx_target="#dialog-container",
-                style="float: right; font-weight: bold",
-                cls="btn",
-            ),
-            Div(
-                Button(
-                    f"Details {what}",
-                    cls="tab active",
-                    hx_get=f"/{proj_name}/{what}/info/{jf_id}",
-                    hx_target="#tab-content",
-                    hx_swap="innerHTML",
-                    _="on click remove .active from .tab then add .active to me",
-                ),
-                Button(
-                    "Graph Flow",
-                    cls="tab",
-                    hx_get=f"/{proj_name}/flows/graph/{jf_id}",
-                    hx_target="#tab-content",
-                    hx_swap="innerHTML",
-                    _="on click remove .active from .tab then add .active to me",
-                ),
-                cls="tab-buttons btn",
-            )
-            if what == "flows"
-            else None,
-            Div(
-                get_info_job_flow(jf_id, what, proj_name),
-                id="tab-content",
-                cls="tab-content",
-            ),
-            cls="tabbed-card",
-        ),
+        detail_card(jf_id, what, proj_name, as_page=False),
         id="my-dialog",
         open="open",
         cls="dialog",
+    )
+
+
+@rt("/{proj_name}/{what}/detail/{jf_id}")
+def get_detail_page(jf_id: str, what: str, proj_name: str, request: Request):
+    """Render the job/flow detail as a standalone, URL-addressable page."""
+    content = Div(
+        detail_card(jf_id, what, proj_name, as_page=True),
+        Div(Script(mermaid_js, type="module"), id="dialog-container"),
+        id="prj-container",
+    )
+    # HTMX navigation only needs the fragment; a direct load (refresh/bookmark)
+    # has no HX-Request header and must get the full page (navbar included).
+    if request.headers.get("HX-Request") == "true":
+        return content
+    return PAGE_TITLE, Main(
+        Script(mermaid_js, type="module"),
+        projectbar(proj_name),
+        content,
     )
 
 
@@ -813,7 +1668,7 @@ def close_info():
 
 
 @rt("/{proj_name}/{what}/query")
-def get(proj_name: str, what: str):
+def get(proj_name: str, what: str, request: Request):
     form = Form(
         Group(
             Input(name="db_id", placeholder="DB ID")
@@ -827,10 +1682,19 @@ def get(proj_name: str, what: str):
             Label("State"),
             Select(
                 Option("Any", value=""),
-                *[Option(state.name, value=state.value) for state in JobState],
+                *[
+                    Option(s.name, value=s.value)
+                    for s in (FlowState if what == "flows" else JobState)
+                ],
                 name="state",
                 id="select-job-state",
             ),
+            Label(
+                "Errors only",
+                Input(type="checkbox", name="errors_only", value="1"),
+            )
+            if what == "jobs"
+            else None,
             Input(name="worker", placeholder="Worker") if what == "jobs" else None,
             cls="group",
         ),
@@ -866,21 +1730,36 @@ def get(proj_name: str, what: str):
         Script(mermaid_js, type="module"),
         hx_post=f"/{proj_name}/{what}/query",
         hx_target="#query-results",
+        # Run the query once on initial load (in addition to manual submit) so
+        # the table is populated with default values without an explicit search.
+        hx_trigger="load, submit",
         cls="card",
         id="search-form",
     )
 
+    job_controller = get_job_controller(proj_name)
     if what == "jobs":
         total_entries = job_controller.count_jobs()
     elif what == "flows":
         total_entries = job_controller.count_flows()
 
-    return Div(
+    content = Div(
         H3(f"{what.capitalize()} Query"),
-        H3(f"Total number of {what}: {total_entries}"),
+        P(f"Total number of {what}: {total_entries}", cls="muted"),
         form,
         Div(id="query-results"),
         id="prj-container",
+    )
+
+    # HTMX navigation only needs the fragment (swapped into #prj-container). A
+    # direct browser load (refresh / pasted URL) has no HX-Request header, so
+    # return the full page (navbar included) to avoid a header-less, broken view.
+    if request.headers.get("HX-Request") == "true":
+        return content
+    return PAGE_TITLE, Main(
+        Script(mermaid_js, type="module"),
+        projectbar(proj_name),
+        content,
     )
 
 
@@ -889,49 +1768,55 @@ def post(
     proj_name: str,
     what: str,
     db_id: str = "",
+    flow_id: str = "",
     uuid: str = "",
     name: str = "",
     state: str = "",
+    errors_only: str = "",
     worker: str = "",
     start_date: str = "",
     start_time: str = "",
     end_date: str = "",
     end_time: str = "",
-    max_results: int = 100,
     timezone_in: str = "",
     sort_by: str = "updated_on",
     sort_order: int = -1,
     page: int = 1,
-    entries_per_page: int = 10,
+    entries_per_page: int = 20,
 ):
-    query: dict[
-        str,
-        str
-        | list[str]
-        | tuple[str, None]
-        | list[tuple[str, None]]
-        | None
-        | JobState
-        | dict[str, str]
-        | datetime,
-    ] = {}
+    # Built dynamically from optional filters and splatted into the controller
+    # query methods, so a permissive value type keeps the call sites type-clean.
+    query: dict[str, Any] = {}
     if db_id:
         query["db_ids"] = [db_id]
-    if uuid:
-        query["job_ids"] = [(uuid, None)]
+    if flow_id:
+        query["flow_ids"] = [flow_id]
+    # A uuid alone does not identify a single Job (the (uuid, index) pair does),
+    # so match every index of that uuid via a generic query. Jobs-only: the
+    # uuid field has no meaning for the flows query.
+    custom_query = {"uuid": uuid} if uuid else None
     if name:
         query["name"] = name
-    if state:
-        query["states"] = None if state == "Any" else JobState(state)
+    # "Errors only" (jobs) overrides the single-state select to match both error
+    # states at once.
+    if errors_only and what == "jobs":
+        query["states"] = [JobState.FAILED, JobState.REMOTE_ERROR]
+    elif state:
+        query["states"] = FlowState(state) if what == "flows" else JobState(state)
     if worker:
-        query["metadata"] = {"worker": worker}
+        query["workers"] = [worker]
 
+    tz: tzinfo | None = None
     if timezone_in:
-        tz = ZoneInfo(timezone_in)
-    else:
-        # TODO this should be fixed
-        # tz = ZoneInfo(datetime.now(timezone.utc).astimezone().tzname())
-        raise NotImplementedError
+        try:
+            tz = ZoneInfo(timezone_in)
+        except ZoneInfoNotFoundError:
+            tz = None
+    if tz is None:
+        # Fall back to the local timezone of the machine running the GUI. This
+        # is a fixed offset captured now (no IANA name needed), which is correct
+        # for a local single-user GUI where the server clock is the user clock.
+        tz = datetime.now(timezone.utc).astimezone().tzinfo or timezone.utc
 
     if start_time and not start_date:
         start_date = datetime.now().strftime("%Y-%m-%d")
@@ -953,13 +1838,18 @@ def post(
 
     skip = (page - 1) * entries_per_page
 
+    job_controller = get_job_controller(proj_name)
     if what == "jobs":
         jobs_flows = job_controller.get_jobs_info(
-            **query, sort=[[sort_by, sort_order]], limit=entries_per_page, skip=skip
+            **query,
+            custom_query=custom_query,
+            sort=[(sort_by, sort_order)],
+            limit=entries_per_page,
+            skip=skip,
         )
     elif what == "flows":
         jobs_flows = job_controller.get_flows_info(
-            **query, sort=[[sort_by, sort_order]], limit=entries_per_page, skip=skip
+            **query, sort=[(sort_by, sort_order)], limit=entries_per_page, skip=skip
         )
 
     if not jobs_flows:
@@ -979,7 +1869,7 @@ def post(
                     "DB id",
                     hx_post=f"/{proj_name}/{what}/query",
                     hx_include="previous form",
-                    hx_vals=f'{{"sort_by":"db_id", "sort_order":"{next_sort_order if sort_by == "db_id" else 1}"}}',
+                    hx_vals=f'{{"sort_by":"db_id", "sort_order":"{next_sort_order if sort_by == "db_id" else 1}", "page":1}}',
                     hx_swap="innerHTML",
                     hx_target="#query-results",
                 )
@@ -991,7 +1881,7 @@ def post(
                     "UUID",
                     hx_post=f"/{proj_name}/{what}/query",
                     hx_include="previous form",
-                    hx_vals=f'{{"sort_by":"uuid", "sort_order":"{next_sort_order if sort_by == "uuid" else 1}"}}',
+                    hx_vals=f'{{"sort_by":"uuid", "sort_order":"{next_sort_order if sort_by == "uuid" else 1}", "page":1}}',
                     hx_swap="innerHTML",
                     hx_target="#query-results",
                 )
@@ -1001,17 +1891,18 @@ def post(
                     "Name",
                     hx_post=f"/{proj_name}/{what}/query",
                     hx_include="previous form",
-                    hx_vals=f'{{"sort_by":"job.name", "sort_order":"{next_sort_order if sort_by == "job.name" else 1}"}}',
+                    hx_vals=f'{{"sort_by":"job.name", "sort_order":"{next_sort_order if sort_by == "job.name" else 1}", "page":1}}',
                     hx_swap="innerHTML",
                     hx_target="#query-results",
                 )
             ),
+            Th("Jobs") if what == "flows" else None,
             Th(
                 A(
                     "State",
                     hx_post=f"/{proj_name}/{what}/query",
                     hx_include="previous form",
-                    hx_vals=f'{{"sort_by":"state", "sort_order":"{next_sort_order if sort_by == "state" else 1}"}}',
+                    hx_vals=f'{{"sort_by":"state", "sort_order":"{next_sort_order if sort_by == "state" else 1}", "page":1}}',
                     hx_swap="innerHTML",
                     hx_target="#query-results",
                 )
@@ -1021,7 +1912,7 @@ def post(
                     "Worker",
                     hx_post=f"/{proj_name}/{what}/query",
                     hx_include="previous form",
-                    hx_vals=f'{{"sort_by":"worker", "sort_order":"{next_sort_order if sort_by == "worker" else 1}"}}',
+                    hx_vals=f'{{"sort_by":"worker", "sort_order":"{next_sort_order if sort_by == "worker" else 1}", "page":1}}',
                     hx_swap="innerHTML",
                     hx_target="#query-results",
                 )
@@ -1033,7 +1924,7 @@ def post(
                     "Updated",
                     hx_post=f"/{proj_name}/{what}/query",
                     hx_include="previous form",
-                    hx_vals=f'{{"sort_by":"updated_on", "sort_order":"{next_sort_order if sort_by == "updated_on" else 1}"}}',
+                    hx_vals=f'{{"sort_by":"updated_on", "sort_order":"{next_sort_order if sort_by == "updated_on" else 1}", "page":1}}',
                     hx_swap="innerHTML",
                     hx_target="#query-results",
                 )
@@ -1045,52 +1936,47 @@ def post(
         ),
         *[
             Tr(
-                Td(
-                    A(
-                        entry.db_id,
-                        hx_get=f"/{proj_name}/{what}/dialog/{entry.db_id}",
-                        hx_target="#dialog-container",
-                        hx_swap="innerHTML",
-                    )
-                )
-                if what == "jobs"
-                else None,
+                # The whole row opens the details popup; the id is shown as
+                # link-styled text (no nested link, to avoid a double request).
+                Td(Span(entry.db_id, cls="row-id")) if what == "jobs" else None,
                 Td(entry.uuid)
                 if what == "jobs"
-                else Td(
-                    A(
-                        entry.flow_id,
-                        hx_get=f"/{proj_name}/{what}/dialog/{entry.flow_id}",
-                        hx_target="#dialog-container",
-                        hx_swap="innerHTML",
-                    )
-                ),
+                else Td(Span(entry.flow_id, cls="row-id")),
                 Td(entry.name),
-                Td(entry.state.value),
+                # ``db_ids`` is always populated (no extra query needed), so the
+                # job count is free for the flows list.
+                Td(str(len(entry.db_ids))) if what == "flows" else None,
+                Td(state_badge(entry.state)),
                 Td(entry.worker) if what == "jobs" else None,
                 Td(
                     entry.updated_on.replace(tzinfo=timezone.utc)
                     .astimezone(tz)
                     .strftime("%Y-%m-%d %H:%M:%S")
                 ),
+                # Protected "safe zone": clicking anywhere in this cell toggles
+                # the checkbox without bubbling up to open the details popup.
                 Td(
                     Input(
                         type="checkbox",
                         name="ckbx_action",
-                        value=f"{entry.db_id if what=='jobs' else entry.flow_id}",
-                        id=f"{entry.db_id if what=='jobs' else entry.flow_id}",
+                        value=f"{entry.db_id if what == 'jobs' else entry.flow_id}",
+                        id=f"{entry.db_id if what == 'jobs' else entry.flow_id}",
                     ),
-                    style="text-align: right",
+                    onclick="event.stopPropagation()",
+                    cls="action-cell",
                 ),
-                style="background-color: #f5f5f5;" if i % 2 == 0 else "",
+                hx_get=f"/{proj_name}/{what}/dialog/{entry.db_id if what == 'jobs' else entry.flow_id}",
+                hx_target="#dialog-container",
+                hx_swap="innerHTML",
+                cls="job-row",
             )
-            for i, entry in enumerate(all_entries)
+            for entry in all_entries
         ],
         cls="card",
     )
 
     if what == "jobs":
-        total_entries = job_controller.count_jobs(**query)
+        total_entries = job_controller.count_jobs(**query, query=custom_query)
     elif what == "flows":
         total_entries = job_controller.count_flows(**query)
 
@@ -1098,25 +1984,26 @@ def post(
 
     if what == "jobs":
         # all_job_flow_ids = [entry.db_id for entry in all_entries]
-        action_btns_lbl = ("Rerun", "Play", "Pause", "Stop", "Retry")
+        action_btns_lbl = ("Rerun", "Resume", "Pause", "Stop", "Retry")
     elif what == "flows":
         # all_job_flow_ids = [entry.flow_id for entry in all_entries]
         action_btns_lbl = ("Delete",)  # type: ignore[assignment]
 
+    # Destructive actions get the danger (red) button variant.
+    danger_actions = {"Stop", "Delete"}
     action_btns = Group(
         Label("Actions:   "),
         *[
             Button(
                 name,
-                hx_post=f"/actions/{name}/{what}/open_dialog",
+                hx_post=f"/actions/{proj_name}/{name}/{what}/open_dialog",
                 hx_target="#dialog-container",
                 hx_include="[name='ckbx_action']",
-                cls="btn",
+                cls="btn btn-danger" if name in danger_actions else "btn",
             )
             for name in action_btns_lbl
         ],
-        style="float: right",
-        cls="group",
+        cls="group toolbar-right",
     )
 
     pagination = Div(
@@ -1124,7 +2011,7 @@ def post(
             "Previous",
             hx_post=f"/{proj_name}/{what}/query",
             hx_include="previous form",
-            hx_vals=f'{{"page":{page-1}}}',
+            hx_vals=f'{{"page":{page - 1}, "sort_by":"{sort_by}", "sort_order":"{sort_order}"}}',
             hx_swap="innerHTML",
             hx_target="#query-results",
         )
@@ -1135,7 +2022,7 @@ def post(
                 str(i),
                 hx_post=f"/{proj_name}/{what}/query",
                 hx_include="previous form",
-                hx_vals=f'{{"page":{i}}}',
+                hx_vals=f'{{"page":{i}, "sort_by":"{sort_by}", "sort_order":"{sort_order}"}}',
                 hx_swap="innerHTML",
                 hx_target="#query-results",
             )
@@ -1145,7 +2032,7 @@ def post(
             "Next",
             hx_post=f"/{proj_name}/{what}/query",
             hx_include="previous form",
-            hx_vals=f'{{"page":{page+1}}}',
+            hx_vals=f'{{"page":{page + 1}, "sort_by":"{sort_by}", "sort_order":"{sort_order}"}}',
             hx_swap="innerHTML",
             hx_target="#query-results",
         )
@@ -1170,8 +2057,176 @@ def post(
     ), Div(Script(mermaid_js, type="module"), id="dialog-container")
 
 
+@rt("/{proj_name}/flows/board", methods=["GET"])
+def get_flows_board(proj_name: str, request: Request):
+    """
+    Render the flows board: a filterable, paginated accordion of flow cards.
+
+    The filter form mirrors the flows query form and posts back to this same
+    path; the results (the accordion list) are swapped into ``#board-results``.
+    Reuses the existing flows query/pagination machinery and the per-job dialog.
+    """
+    form = Form(
+        Group(
+            Input(name="flow_id", placeholder="Flow ID"),
+            Input(name="name", placeholder="Flow Name"),
+            cls="group",
+        ),
+        Group(
+            Label("State"),
+            Select(
+                Option("Any", value=""),
+                *[Option(s.name, value=s.value) for s in FlowState],
+                name="state",
+            ),
+            cls="group",
+        ),
+        Group(
+            Label("Start Date/Time"),
+            Input(type="date", name="start_date"),
+            Input(type="time", name="start_time"),
+            Label("End Date/Time"),
+            Input(type="date", name="end_date"),
+            Input(type="time", name="end_time"),
+            cls="group",
+        ),
+        Group(
+            Label("Entries per page"),
+            Select(
+                *[
+                    Option(str(i), value=str(i), selected=(i == 20))
+                    for i in (10, 20, 50, 100)
+                ],
+                name="entries_per_page",
+            ),
+            cls="group",
+        ),
+        Input(type="hidden", name="timezone_in", value="", id="timezone_in"),
+        Button("Search", cls="btn"),
+        Script(js_timezone),
+        hx_post=f"/{proj_name}/flows/board",
+        hx_target="#board-results",
+        # Run once on load (besides manual submit) so the board is populated
+        # with default values without an explicit search.
+        hx_trigger="load, submit",
+        cls="card",
+        id="board-form",
+    )
+
+    content = Div(
+        H3("Flows board"),
+        form,
+        Div(id="board-results"),
+        Div(Script(mermaid_js, type="module"), id="dialog-container"),
+        id="prj-container",
+    )
+
+    # HTMX navigation only needs the fragment; a direct browser load (refresh /
+    # pasted URL) has no HX-Request header and must get the full page.
+    if request.headers.get("HX-Request") == "true":
+        return content
+    return PAGE_TITLE, Main(
+        Script(mermaid_js, type="module"),
+        projectbar(proj_name),
+        content,
+    )
+
+
+@rt("/{proj_name}/flows/board", methods=["POST"])
+def post_flows_board(
+    proj_name: str,
+    flow_id: str = "",
+    name: str = "",
+    state: str = "",
+    start_date: str = "",
+    start_time: str = "",
+    end_date: str = "",
+    end_time: str = "",
+    page: int = 1,
+    entries_per_page: int = 20,
+):
+    """Query flows (with their jobs) and return the paginated accordion list."""
+    query: dict[str, Any] = {}
+    if flow_id:
+        query["flow_ids"] = [flow_id]
+    if name:
+        query["name"] = name
+    if state:
+        query["states"] = FlowState(state)
+
+    if start_time and not start_date:
+        start_date = datetime.now().strftime("%Y-%m-%d")
+    if start_date:
+        fmt = "%Y-%m-%d %H:%M" if start_time else "%Y-%m-%d"
+        value = f"{start_date} {start_time}" if start_time else start_date
+        query["start_date"] = datetime.strptime(value, fmt)
+    if end_time and not end_date:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+    if end_date:
+        fmt = "%Y-%m-%d %H:%M" if end_time else "%Y-%m-%d"
+        value = f"{end_date} {end_time}" if end_time else end_date
+        query["end_date"] = datetime.strptime(value, fmt)
+
+    skip = (page - 1) * entries_per_page
+    job_controller = get_job_controller(proj_name)
+    flows = job_controller.get_flows_info(
+        **query,
+        with_jobs_info=True,
+        sort=[("updated_on", -1)],
+        limit=entries_per_page,
+        skip=skip,
+    )
+
+    if not flows:
+        return Div(P("No flows found matching the criteria."), cls="card")
+
+    total_entries = job_controller.count_flows(**query)
+    total_pages = ceil(total_entries / entries_per_page)
+
+    pagination = Div(
+        A(
+            "Previous",
+            hx_post=f"/{proj_name}/flows/board",
+            hx_include="#board-form",
+            hx_vals=f'{{"page":{page - 1}}}',
+            hx_target="#board-results",
+        )
+        if page > 1
+        else Span("Previous"),
+        *[
+            A(
+                str(i),
+                hx_post=f"/{proj_name}/flows/board",
+                hx_include="#board-form",
+                hx_vals=f'{{"page":{i}}}',
+                hx_target="#board-results",
+            )
+            for i in range(max(1, page - 2), min(total_pages + 1, page + 3))
+        ],
+        A(
+            "Next",
+            hx_post=f"/{proj_name}/flows/board",
+            hx_include="#board-form",
+            hx_vals=f'{{"page":{page + 1}}}',
+            hx_target="#board-results",
+        )
+        if page < total_pages
+        else Span("Next"),
+        cls="pagination",
+    )
+
+    return Div(
+        H4(f"Total after filter: {total_entries}"),
+        *[flow_board_card(flow, proj_name) for flow in flows],
+        pagination,
+        id="board-results",
+    )
+
+
 @requires(
-    fasthtml is not None, "The 'python-fasthtml' package is required to run the gui."
+    fasthtml is not None and charts is not None,
+    "The 'gui' extra is required to run the gui. Install it with "
+    "`pip install jobflow-remote[gui]`.",
 )
 def start_gui(port: int | None = None):
     serve(
